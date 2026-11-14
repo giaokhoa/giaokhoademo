@@ -199,6 +199,11 @@ describe('Chốt chặn component cấp quyền: endpoint chung bị cấm + đ�
       await pg.query('update payments set tenant_id = $1 where id = $2', [forgedTenantId, payment.id]);
       await postIpn(ipnBody(payment.paymentCode!, FEE_COST));
       await waitPaymentStatus(payment.id, 'needs_review');
+      const provider = await pg.query<{ match_status: string; matched_payment_id: string }>(
+        'select match_status, matched_payment_id from payment_provider_events where extracted_code = $1 order by received_at desc limit 1',
+        [payment.paymentCode],
+      );
+      expect(provider.rows).toEqual([{ match_status: 'needs_review', matched_payment_id: payment.id }]);
       expect(await enrolmentActive(course.id, buyer.token)).toBe(false);
     } finally {
       await pg.query('update payments set tenant_id = $1 where id = $2', [payment.tenantId, payment.id]);

@@ -14,6 +14,7 @@ import {
 } from '@giaokhoa/payments';
 import type { PaymentSettlementPort } from '@giaokhoa/payments';
 import { tenantAls } from './db/tenant-als';
+import { SpaceRoutingError } from './db/routing/space-connection-resolver';
 import { WorkerEnrolOutboxService } from './worker-enrol-outbox.service';
 import { WorkerPaymentSpaceScope } from './worker-payment-space-scope.service';
 
@@ -41,11 +42,45 @@ export class WorkerPaymentSettlementService implements PaymentSettlementPort {
 
   async verifyPaymentAgainstServerTarget(payment: PaymentRow): Promise<boolean> {
     if (payment.component === 'enrol_fee' || payment.component === 'class_fee') {
-      return this.spaceScope.runForTenant(payment.tenantId, () =>
-        this.verifyTargetInCurrentScope(payment),
-      );
+      // The event was claimed in an already-pinned ledger. A local target
+      // wins over a mutable payment.tenantId: tampering its tenant cannot
+      // redirect the verification to an unregistered centre.
+      if ((tenantAls.getStore()?.platform || tenantAls.getStore()?.spaceSlug)
+        && await this.targetExistsInCurrentScope(payment)) {
+        return this.verifyTargetInCurrentScope(payment);
+      }
+      // Payments may live in the platform ledger while the enrolment target
+      // lives in a dedicated centre. Resolve the registered target for valid
+      // ownership, preserving its tenant RLS scope. A tampered tenant which is
+      // absent/unregistered is a business mismatch (needs_review), not a
+      // reason to strand the provider event in processing. Real routing and
+      // connection failures must still throw and retry.
+      try {
+        return await this.spaceScope.runForTenant(payment.tenantId, () =>
+          this.verifyTargetInCurrentScope(payment),
+        );
+      } catch (error) {
+        if (error instanceof SharedDomainError && error.code === 'tenant.not_found') return false;
+        if (error instanceof SpaceRoutingError && error.code === 'space_routing.space_not_found') return false;
+        throw error;
+      }
     }
     return tenantAls.run({ platform: true }, () => this.verifyTargetInCurrentScope(payment));
+  }
+
+  private async targetExistsInCurrentScope(payment: PaymentRow): Promise<boolean> {
+    if (!payment.itemId) return false;
+    if (payment.component === 'enrol_fee') {
+      return !!(await this.spaceScope.routedKysely
+        .selectFrom('enrol').select('id')
+        .where('id', '=', payment.itemId).executeTakeFirst());
+    }
+    if (payment.component === 'class_fee') {
+      return !!(await this.spaceScope.routedKysely
+        .selectFrom('classes').select('id')
+        .where('id', '=', payment.itemId).executeTakeFirst());
+    }
+    return false;
   }
 
   private async verifyTargetInCurrentScope(payment: PaymentRow): Promise<boolean> {

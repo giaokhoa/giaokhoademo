@@ -3,11 +3,12 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { Client } from 'pg';
 import { randomInt } from 'node:crypto';
 import {
-  adminToken, createTestApp, createUserViaApi, http, login, roleIdByShortname, STRONG_PASSWORD, uniqueName, grantTenantManagerFixture,
+  adminToken, createTestApp, createUserViaApi, http, login, roleIdByShortname, STRONG_PASSWORD, uniqueName,
 } from '../../support/identity-access-helpers';
 import { createCategory, createEnrolInstance, enrolUser } from '../../support/course-enrolment-helpers';
 import { closeSepaySweepDriver, driveSepaySweep } from '../../support/sepay-sweep-driver';
-import { seedLegacyCentreInShared } from '../../support/pre-migration-tenant.fixture';
+import { DedicatedTestCentres, type DedicatedTestCentre } from '../../support/dedicated-test-centres';
+import { withDatabase } from '@giaokhoa/db/test-support';
 
 const runBankSuffix = randomInt(100000, 1000000).toString();
 const SEPAY_KEY = `sk-test-coupon-slot-${runBankSuffix}`;
@@ -24,7 +25,15 @@ describe('Coupon + giới hạn slot gói (issue #189, lát còn lại 2)', () =
   let sepayAccountId: string;
   let disabledAccountIds: string[] = [];
   let editingteacherRoleId: string;
-  let studentRoleId: string;
+  let dedicated: DedicatedTestCentres;
+  let centres: DedicatedTestCentre[];
+  let nextCentreIndex = 0;
+  const centreClients: Client[] = [];
+  type SchoolFixture = {
+    tenantId: string; ctxId: string; users: { id: string; username: string }[];
+    centre: DedicatedTestCentre; db: Client;
+    editingRoleId: string; studentRoleId: string;
+  };
 
   const auth = (token: string) => ({ Authorization: `Bearer ${token}` });
   const must = async (res: { status: number; body: unknown }, what: string) => {
@@ -84,11 +93,6 @@ describe('Coupon + giới hạn slot gói (issue #189, lát còn lại 2)', () =
     return http(app).post('/api/v1/payments/coupons').set(auth(token)).send(body);
   }
 
-  async function createSchoolTenant(): Promise<string> {
-    const slug = `cs-${uniqueName('t').toLowerCase()}`;
-    return seedLegacyCentreInShared({ slug, name: `Trung tâm ${slug}` });
-  }
-
   async function tenantContextId(tenantId: string): Promise<string> {
     const rows = await pg.query('select id from context where context_level = 20 and instance_id = $1', [tenantId]);
     expect(rows.rows.length).toBe(1);
@@ -103,31 +107,58 @@ describe('Coupon + giới hạn slot gói (issue #189, lát còn lại 2)', () =
     return http(app).post('/api/v1/access/assignments').set(auth(admin)).send({ userId, roleId, contextId });
   }
 
-  async function schoolWithMembers(memberCount: number) {
-    const tenantId = await createSchoolTenant();
-    await grantTenantManagerFixture(app, admin, tenantId);
-    const ctxId = await tenantContextId(tenantId);
-    const users: { id: string; username: string }[] = [];
-    for (let i = 0; i < memberCount; i++) {
-      const u = await createUserViaApi(app, admin);
-      users.push(u);
-      await addMember(tenantId, u.id);
+  async function schoolWithMembers(memberCount: number): Promise<SchoolFixture> {
+    const centre = centres[nextCentreIndex++];
+    if (!centre) throw new Error('Not enough dedicated coupon/slot centres');
+    const tenantId = centre.space.tenantId!;
+    const db = new Client({ connectionString: withDatabase(process.env.DATABASE_URL!, centre.space.databaseName) });
+    // The DB handle is used only for fixture inspection and controlled setup;
+    // HTTP requests always use the centre's dedicated application role.
+    await db.connect();
+    centreClients.push(db);
+    const context = await db.query<{ id: string }>(
+      'select id from context where context_level = 20 and instance_id = $1', [tenantId],
+    );
+    expect(context.rows).toHaveLength(1);
+    const users = [];
+    for (let index = 0; index < memberCount; index++) {
+      const created = await dedicated.createUser(app, centre, 'slotmember');
+      users.push({ id: created.id, username: created.username });
     }
-    return { tenantId, ctxId, users };
+    return {
+      tenantId, ctxId: context.rows[0]!.id, users, centre, db,
+      editingRoleId: await dedicated.roleId(app, centre, 'editingteacher'),
+      studentRoleId: await dedicated.roleId(app, centre, 'student'),
+    };
+  }
+
+  async function assignSchoolRole(fixture: SchoolFixture, userId: string, role: 'editingteacher' | 'student' = 'editingteacher') {
+    return http(app).post('/api/v1/access/assignments')
+      .set('Host', fixture.centre.host).set(auth(fixture.centre.adminToken))
+      .send({ userId, roleId: role === 'student' ? fixture.studentRoleId : fixture.editingRoleId, contextId: fixture.ctxId });
   }
 
   async function craftTenantEntitlement(
-    tenantId: string,
+    fixture: SchoolFixture,
     startsAt: Date,
     expiresAt: Date,
     status: 'active' | 'suspended' = 'active',
   ) {
-    const { token } = await createBuyer();
-    const payment = await buyPlan(token, 'tenant_plan');
-    await pg.query(
+    // This test creates controlled entitlement histories, not a plan checkout.
+    // Payment and entitlement must both live in the same dedicated database.
+    const { tenantId, db, centre } = fixture;
+    const account = await db.query<{ id: string }>(
+      "insert into payment_accounts (tenant_id, name, gateway) values ($1, $2, 'manual') returning id",
+      [tenantId, uniqueName('slot-account')],
+    );
+    const payment = await db.query<{ id: string }>(
+      "insert into payments (account_id, tenant_id, user_id, amount, currency, status, gateway, component) values ($1,$2,$3,$4,'VND','succeeded','manual','tenant_plan') returning id",
+      [account.rows[0]!.id, tenantId, centre.space.adminUserId, TENANT_PLAN_DEFAULT_PRICE],
+    );
+    await db.query(
       `insert into plan_entitlements (tenant_id, user_id, component, payment_id, starts_at, expires_at, status)
        values ($1, null, 'tenant_plan', $2, $3, $4, $5)`,
-      [tenantId, payment.id, startsAt.toISOString(), expiresAt.toISOString(), status],
+      [tenantId, payment.rows[0]!.id, startsAt.toISOString(), expiresAt.toISOString(), status],
     );
   }
 
@@ -140,12 +171,18 @@ describe('Coupon + giới hạn slot gói (issue #189, lát còn lại 2)', () =
   }
 
   beforeAll(async () => {
-    app = await createTestApp();
+    dedicated = new DedicatedTestCentres();
+    const run = randomInt(100000, 1000000).toString();
+    await dedicated.provision(Array.from({ length: 7 }, (_, i) => `slot-${run}-${i}`));
+    // Seven independent test centres exceed the default production pool cap (6).
+    // Override only this Nest test app; no production/default config is altered.
+    app = await createTestApp({ SPACE_DB_MAX_POOLS: '9' });
+    centres = await dedicated.activate(app);
+    for (const centre of centres) await dedicated.grantCentreManager(app, centre);
     admin = await adminToken(app);
     pg = new Client({ connectionString: process.env.DATABASE_URL });
     await pg.connect();
     editingteacherRoleId = await roleIdByShortname(app, admin, 'editingteacher');
-    studentRoleId = await roleIdByShortname(app, admin, 'student');
     const res = await http(app).post('/api/v1/payments/accounts').set(auth(admin))
       .send({
         name: 'SePay platform coupon-slot', gateway: 'sepay',
@@ -161,15 +198,17 @@ describe('Coupon + giới hạn slot gói (issue #189, lát còn lại 2)', () =
     if (disabledAccountIds.length > 0) {
       await pg.query('update payment_accounts set enabled = false where id = any($1)', [disabledAccountIds]);
     }
-  });
+  }, 300_000);
 
   afterAll(async () => {
     if (disabledAccountIds.length > 0) {
       await pg.query('update payment_accounts set enabled = true where id = any($1)', [disabledAccountIds]);
     }
     await closeSepaySweepDriver();
-    await pg.end();
-    await app.close();
+    await pg?.end();
+    for (const client of centreClients) await client.end();
+    await app?.close();
+    await dedicated?.cleanup();
   });
 
 
@@ -289,45 +328,49 @@ describe('Coupon + giới hạn slot gói (issue #189, lát còn lại 2)', () =
 
 
   it('slot trung tâm — mức nền: học viên không tính; giáo viên thứ 4 bị chặn và không sinh dòng gán; nâng mức nền qua Cài đặt hệ thống thì gán được', async () => {
-    const { ctxId, users } = await schoolWithMembers(9);
+    const fixture = await schoolWithMembers(9);
+    const { ctxId, users } = fixture;
     const students = users.slice(0, 5);
     const teachers = users.slice(5);
 
     for (const s of students) {
-      const res = await assignRoleRaw(s.id, studentRoleId, ctxId);
+      const res = await assignSchoolRole(fixture, s.id, 'student');
       expect(res.status).toBeLessThan(300);
     }
     for (const t of teachers.slice(0, 3)) {
-      const res = await assignRoleRaw(t.id, editingteacherRoleId, ctxId);
+      const res = await assignSchoolRole(fixture, t.id);
       expect(res.status).toBeLessThan(300);
     }
-    const blocked = await assignRoleRaw(teachers[3]!.id, editingteacherRoleId, ctxId);
+    const blocked = await assignSchoolRole(fixture, teachers[3]!.id);
     expect(blocked.status).toBe(400);
     expect((blocked.body as { code: string }).code).toBe('plan.tenant_slot_limit_reached');
-    const rows = await pg.query(
+    const rows = await fixture.db.query(
       'select user_id from role_assignments where context_id = $1 and role_id = $2 order by user_id',
-      [ctxId, editingteacherRoleId],
+      [ctxId, fixture.editingRoleId],
     );
     expect(rows.rows.length).toBe(3);
     expect((rows.rows as { user_id: string }[]).map((r) => r.user_id)).not.toContain(teachers[3]!.id);
 
-    const set = await http(app).put('/api/v1/site-config/payments/tenantplanfreeslots').set(auth(admin)).send({ value: 4 });
-    expect(set.status).toBeLessThan(300);
+    await fixture.db.query(
+      "insert into plugin_config (plugin, name, value) values ('payments', 'tenantplanfreeslots', '4')",
+    );
     try {
-      const allowed = await assignRoleRaw(teachers[3]!.id, editingteacherRoleId, ctxId);
+      const allowed = await assignSchoolRole(fixture, teachers[3]!.id);
       expect(allowed.status).toBeLessThan(300);
     } finally {
-      const clear = await http(app).delete('/api/v1/site-config/payments/tenantplanfreeslots').set(auth(admin));
-      expect(clear.status).toBeLessThan(300);
+      await fixture.db.query(
+        "delete from plugin_config where plugin = 'payments' and name = 'tenantplanfreeslots' and tenant_id is null",
+      );
     }
   });
 
   it('slot trung tâm — gói đang hoạt động: hạn mức gói (30) thay mức nền, giáo viên thứ 4 và thứ 5 gán được', async () => {
-    const { tenantId, ctxId, users } = await schoolWithMembers(5);
+    const fixture = await schoolWithMembers(5);
+    const { users } = fixture;
     const now = Date.now();
-    await craftTenantEntitlement(tenantId, new Date(now - DAY_MS), new Date(now + 364 * DAY_MS));
+    await craftTenantEntitlement(fixture, new Date(now - DAY_MS), new Date(now + 364 * DAY_MS));
     for (const t of users) {
-      const res = await assignRoleRaw(t.id, editingteacherRoleId, ctxId);
+      const res = await assignSchoolRole(fixture, t.id);
       expect(res.status).toBeLessThan(300);
     }
   });
@@ -335,76 +378,79 @@ describe('Coupon + giới hạn slot gói (issue #189, lát còn lại 2)', () =
   it('slot trung tâm — ân hạn: gói hết hạn 3 ngày vẫn áp hạn mức gói; hết hạn 10 ngày (qua ân hạn 7) rơi về mức nền', async () => {
     const grace = await schoolWithMembers(4);
     const now = Date.now();
-    await craftTenantEntitlement(grace.tenantId, new Date(now - 368 * DAY_MS), new Date(now - 3 * DAY_MS));
+    await craftTenantEntitlement(grace, new Date(now - 368 * DAY_MS), new Date(now - 3 * DAY_MS));
     for (const t of grace.users) {
-      const res = await assignRoleRaw(t.id, editingteacherRoleId, grace.ctxId);
+      const res = await assignSchoolRole(grace, t.id);
       expect(res.status).toBeLessThan(300);
     }
 
     const expired = await schoolWithMembers(4);
-    await craftTenantEntitlement(expired.tenantId, new Date(now - 375 * DAY_MS), new Date(now - 10 * DAY_MS));
+    await craftTenantEntitlement(expired, new Date(now - 375 * DAY_MS), new Date(now - 10 * DAY_MS));
     for (const t of expired.users.slice(0, 3)) {
-      const res = await assignRoleRaw(t.id, editingteacherRoleId, expired.ctxId);
+      const res = await assignSchoolRole(expired, t.id);
       expect(res.status).toBeLessThan(300);
     }
-    const blocked = await assignRoleRaw(expired.users[3]!.id, editingteacherRoleId, expired.ctxId);
+    const blocked = await assignSchoolRole(expired, expired.users[3]!.id);
     expect(blocked.status).toBe(400);
     expect((blocked.body as { code: string }).code).toBe('plan.tenant_slot_limit_reached');
   });
 
   it('slot trung tâm — ân hạn không tính quyền lợi tương lai: quyền lợi hiện hành đã đình chỉ và quyền lợi cũ đã qua ân hạn thì áp mức nền', async () => {
-    const { tenantId, ctxId, users } = await schoolWithMembers(4);
+    const fixture = await schoolWithMembers(4);
+    const { users } = fixture;
     const now = Date.now();
 
-    await craftTenantEntitlement(tenantId, new Date(now - DAY_MS), new Date(now + 364 * DAY_MS), 'suspended');
-    await craftTenantEntitlement(tenantId, new Date(now - 375 * DAY_MS), new Date(now - 10 * DAY_MS));
-    await craftTenantEntitlement(tenantId, new Date(now + DAY_MS), new Date(now + 365 * DAY_MS));
+    await craftTenantEntitlement(fixture, new Date(now - DAY_MS), new Date(now + 364 * DAY_MS), 'suspended');
+    await craftTenantEntitlement(fixture, new Date(now - 375 * DAY_MS), new Date(now - 10 * DAY_MS));
+    await craftTenantEntitlement(fixture, new Date(now + DAY_MS), new Date(now + 365 * DAY_MS));
 
     for (const t of users.slice(0, 3)) {
-      const res = await assignRoleRaw(t.id, editingteacherRoleId, ctxId);
+      const res = await assignSchoolRole(fixture, t.id);
       expect(res.status).toBeLessThan(300);
     }
-    const blocked = await assignRoleRaw(users[3]!.id, editingteacherRoleId, ctxId);
+    const blocked = await assignSchoolRole(fixture, users[3]!.id);
     expect(blocked.status).toBe(400);
     expect((blocked.body as { code: string }).code).toBe('plan.tenant_slot_limit_reached');
   });
 
   it('slot trung tâm — kích hoạt lại membership của giáo viên đã có vai trò: bị chặn ở hạn mức, membership giữ nguyên trạng thái cũ', async () => {
-    const { tenantId, ctxId, users } = await schoolWithMembers(4);
+    const fixture = await schoolWithMembers(4);
+    const { tenantId, users } = fixture;
     for (const t of users.slice(0, 3)) {
-      const res = await assignRoleRaw(t.id, editingteacherRoleId, ctxId);
+      const res = await assignSchoolRole(fixture, t.id);
       expect(res.status).toBeLessThan(300);
     }
     const fourth = users[3]!;
-    const suspend = await http(app).patch(`/api/v1/tenants/${tenantId}/members/${fourth.id}`).set(auth(admin)).send({ status: 'suspended' });
+    const suspend = await http(app).patch(`/api/v1/tenants/${tenantId}/members/${fourth.id}`).set(auth(fixture.centre.adminToken)).send({ status: 'suspended' });
     expect(suspend.status).toBeLessThan(300);
-    const assign = await assignRoleRaw(fourth.id, editingteacherRoleId, ctxId);
+    const assign = await assignSchoolRole(fixture, fourth.id);
     expect(assign.status).toBeLessThan(300);
 
-    const reactivate = await http(app).patch(`/api/v1/tenants/${tenantId}/members/${fourth.id}`).set(auth(admin)).send({ status: 'active' });
+    const reactivate = await http(app).patch(`/api/v1/tenants/${tenantId}/members/${fourth.id}`).set(auth(fixture.centre.adminToken)).send({ status: 'active' });
     expect(reactivate.status).toBe(400);
     expect((reactivate.body as { code: string }).code).toBe('plan.tenant_slot_limit_reached');
-    const membership = await pg.query('select status from tenant_memberships where tenant_id = $1 and user_id = $2', [tenantId, fourth.id]);
+    const membership = await fixture.db.query('select status from tenant_memberships where tenant_id = $1 and user_id = $2', [tenantId, fourth.id]);
     expect((membership.rows[0] as { status: string }).status).toBe('suspended');
   });
 
   it('slot trung tâm — bỏ đình chỉ tài khoản giáo viên khi tenant đã chạm hạn mức: bị chặn, tài khoản giữ nguyên đình chỉ', async () => {
-    const { tenantId, ctxId, users } = await schoolWithMembers(3);
+    const fixture = await schoolWithMembers(3);
+    const { users } = fixture;
     for (const t of users) {
-      const res = await assignRoleRaw(t.id, editingteacherRoleId, ctxId);
+      const res = await assignSchoolRole(fixture, t.id);
       expect(res.status).toBeLessThan(300);
     }
-    const fourth = await createUserViaApi(app, admin);
-    const suspended = await http(app).post(`/api/v1/users/${fourth.id}/suspend`).set(auth(admin));
+    const fourth = await dedicated.createUser(app, fixture.centre, 'slotFourth');
+    const suspended = await http(app).post(`/api/v1/users/${fourth.id}/suspend`).set(auth(fixture.centre.adminToken));
     expect(suspended.status).toBeLessThan(300);
-    await addMember(tenantId, fourth.id);
-    const assign = await assignRoleRaw(fourth.id, editingteacherRoleId, ctxId);
+    expect((await fixture.db.query('select status from tenant_memberships where user_id=$1', [fourth.id])).rows[0]?.status).toBe('active');
+    const assign = await assignSchoolRole(fixture, fourth.id);
     expect(assign.status).toBeLessThan(300);
 
-    const reactivate = await http(app).post(`/api/v1/users/${fourth.id}/reactivate`).set(auth(admin));
+    const reactivate = await http(app).post(`/api/v1/users/${fourth.id}/reactivate`).set(auth(fixture.centre.adminToken));
     expect(reactivate.status).toBe(400);
     expect((reactivate.body as { code: string }).code).toBe('plan.tenant_slot_limit_reached');
-    const account = await pg.query('select suspended from users where id = $1', [fourth.id]);
+    const account = await fixture.db.query('select suspended from users where id = $1', [fourth.id]);
     expect((account.rows[0] as { suspended: boolean }).suspended).toBe(true);
   });
 

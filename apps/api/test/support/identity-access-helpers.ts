@@ -2,6 +2,8 @@ import { INestApplication, VersioningType } from '@nestjs/common';
 import type { NestExpressApplication } from '@nestjs/platform-express';
 import { Test } from '@nestjs/testing';
 import { JwtService } from '@nestjs/jwt';
+import { ConfigService } from '@nestjs/config';
+import { validateEnv } from '../../src/config/env';
 import { TenantsService } from '../../src/modules/tenants/tenants.service';
 import { RolesService } from '../../src/modules/access/roles.service';
 import { ContextsService } from '../../src/modules/access/contexts.service';
@@ -16,8 +18,13 @@ process.env.FILE_STORAGE_DIR = process.env.FILE_STORAGE_DIR ?? '/tmp/giaokhoa-te
 export const ADMIN = { username: 'admin', password: 'Admin123!' };
 export const STRONG_PASSWORD = 'Passw0rd!';
 
-export async function createTestApp(): Promise<INestApplication> {
-  const moduleRef = await Test.createTestingModule({ imports: [AppModule] }).compile();
+export async function createTestApp(configOverrides?: Record<string, string>): Promise<INestApplication> {
+  const builder = Test.createTestingModule({ imports: [AppModule] });
+  if (configOverrides) {
+    builder.overrideProvider(ConfigService)
+      .useValue(new ConfigService(validateEnv({ ...process.env, ...configOverrides })));
+  }
+  const moduleRef = await builder.compile();
   const app = moduleRef.createNestApplication();
   enableTrustedProxy(app as NestExpressApplication);
   app.setGlobalPrefix('api');

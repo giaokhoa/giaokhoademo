@@ -38,7 +38,7 @@ Các lỗi `ProblemDetailsFilter` ở những ca tiêm lỗi có chủ đích đ
 | AC24      | Chưa chạy thao tác UI thật bằng trình duyệt | Cần tạo/giao đề không copy bắt buộc và tạo bản riêng khi sửa |
 | AC25      | Runtime từ chối tenant school/center không có registry dedicated, không fallback platform; test từ chối legacy 26/26; worker SePay quét dedicated | Chưa diễn tập bootstrap sạch đồng thời bốn miền và loại hết seed/consumer lịch sử |
 | AC26      | Có số đo điểm thời gian PostgreSQL/Redis, trần pool và concurrency; bổ sung fan-out matching SePay theo registry | Thiếu đo tải worker thật với A/B/public đồng thời, Redis/BullMQ, RSS, peak/headroom |
-| AC27      | API unit 626/626, integration 227/227 với client PG18; E2E nhóm 91/91; worker unit 140/140; turbo 33/33; worker integration 178/179 và suite timeout chạy lại 14/14 | Chưa công nhận full worker integration xanh; cần CI, verify/verify-stack SHA sau push và review độc lập |
+| AC27      | Review 6: API unit 629/629, integration 227/227, E2E 6 suite 65/65, worker unit 140/140, turbo 33/33, worker paid-space targeted 5/5 + IPN tamper PASS | Full worker integration local bị container OOM (exit 137), chưa đạt; cần CI E2E 4 shard/verify-stack trên SHA cuối và review độc lập |
 
 ## Lượt sửa theo review PR #62 (head mới chưa qua CI)
 
@@ -157,3 +157,17 @@ Fixture `space-membership-flow` hiện tự gieo dữ liệu lịch sử legacy 
 **Hồi quy worker đầy đủ sau review #5:** 21 file unit / 140 test PASS. Integration 34 file / 179 test: **33 file, 178 test PASS**, một ca notification-events-delivery đợi BullMQ job completed quá 90 giây rồi timeout; chạy lại **nguyên file 14/14 PASS**. Đây là kết quả 2 lượt khác nhau, không ghi full integration là xanh. Lint/typecheck/build trên turbo toàn repo **33/33 tác vụ PASS**. E2E nhóm tám file **91/91 PASS trong cùng một lượt**.
 
 **API test đầy đủ trong lượt review #5:** 73 unit file / **626/626 test PASS**. Integration chạy lại với PostgreSQL client 18 có trên máy (thêm PATH, LD_LIBRARY_PATH và FLEET_PG_BIN_DIR) đạt **40/40 file, 227/227 test PASS**. Lượt integration đầu thiếu pg_dump và có test tìm người dùng trùng tên cố định trên database local tái sử dụng; đổi tên test unique theo run mà vẫn yêu cầu đúng 1 kết quả, hai suite chạy lại 32/32 PASS trước khi full integration PASS. Không thay logic nghiệp vụ để hợp thức hóa fixture.
+
+## Review độc lập lần 6 — sửa hồi quy E2E/RLS và trạng thái CI
+
+Nguồn: [review lần 6 #6877239041](https://github.com/giaokhoa/giaokhoa/pull/62#issuecomment-6877239041). CI trên head 119fca5 FAIL E2E shard 3 và 4; verify-stack, test-api và verify-workspace đã PASS. Không kế thừa CI xanh của c4f53d9.
+
+- **Fixture coupon/slot legacy (P0):** Sáu ca dùng trường học/shared được thay bằng **bảy database trung tâm dedicated thật** và Host/role/control plane độc lập. Vẫn kiểm student không chiếm slot, teacher slot, gói còn hạn/ân hạn/đình chỉ, membership và tài khoản kích hoạt lại. Pool cap = 9 **chỉ trong Nest test app**. Sau khi bỏ quyền hệ thống bổ sung, coupon/slot E2E **13/13 PASS**.
+- **Socket (P0):** JWT không centre claim ở apex bị 401; tạo nhóm/tin nhắn trực tiếp tại Host và database dedicated bằng member có quyền, xác minh tin không tồn tại trong platform. Cookie, presence, sync, typing, JWT mismatch và shared-only negative giữ nguyên; **6/6 PASS**.
+- **IPN tamper (P0):** Có hai nguồn hợp lệ: platform ledger tham chiếu mục tiêu trong dedicated hoặc payment/mục tiêu cùng kho. Trước hết xác minh mục tiêu trong kho chứa provider event; nếu vắng mặt, chỉ resolve đến kho dedicated có đăng ký. Tenant/slug giả không tìm thấy được phân loại needs_review, còn sự cố hạ tầng throw/retry. Không mở shared fallback. Worker paid-space-activation **5/5 PASS**; IPN tamper (b2) PASS, có event needs_review, không ghi danh.
+- **Phân quyền:** CapabilityGuard trước interceptor từng đánh giá quyền ở DB platform cho token dedicated. Nay kiểm capability trong đúng space scope đã xác thực; không bypass guard. Unit guard **3/3 PASS** và E2E slot/role dedicated đạt.
+- **Bằng chứng local:** 6 E2E suite liên quan **65/65 PASS**; API unit **629/629**, integration **227/227**, worker unit **140/140**, turbo lint/typecheck/build **33/33**.
+
+**Chưa nghiệm thu:** full worker integration sau sửa; CI trên SHA mới; clean-room A/B/public/bank, backup/restore gồm dữ liệu+file và cleanup A giữ B/public/bank (AC01–03/AC19–21); thao tác UI browser (AC24); đo tải đồng thời PostgreSQL/Redis/BullMQ/RSS/headroom (AC26). PR Draft và #20/#6 OPEN.
+
+**Sự cố môi trường khi chạy full worker integration review #6:** Sau khi sửa nhánh settlement, lần đầu full worker integration 176/179 (3 ca paid-space không thành công); đã sửa RLS/cross-store theo cả hai hướng, chạy lại targeted paid-space **5/5 PASS** và tamper API **PASS**. Lượt full worker integration tiếp theo bị **Docker OOM, exit 137**, khiến app/PostgreSQL/Redis dừng đồng loạt; đã khởi động lại ba container và xác minh Postgres/Redis sẵn sàng, volume/worktree nguyên vẹn. **Không tính lượt OOM là PASS**; phải dựa vào CI cùng SHA hoặc chạy tách nhóm có kiểm soát bộ nhớ để chốt.

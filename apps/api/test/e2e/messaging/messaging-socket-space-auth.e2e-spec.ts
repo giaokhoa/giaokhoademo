@@ -10,6 +10,9 @@ import { io, type Socket } from 'socket.io-client';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { createControlPlaneKysely } from '@giaokhoa/db/control-plane';
 import { seedLegacyCentreInShared } from '../../support/pre-migration-tenant.fixture';
+import { SpaceDatabaseService } from '../../../src/db/routing/space-database.service';
+import { ContextsService } from '../../../src/modules/access/contexts.service';
+import { RolesService } from '../../../src/modules/access/roles.service';
 
 const BETTER_AUTH_SECRET = 'test-better-auth-secret-at-least-32-chars';
 process.env.BETTER_AUTH_ENABLED = 'true';
@@ -350,6 +353,14 @@ describe('Socket realtime tại địa chỉ trung tâm ở kho riêng (đầu-c
       await copyMemberToCentre(member.id, tenantId);
     }
 
+    await app.get(SpaceDatabaseService).withSpaceKysely(CENTRE_SLUG, async () => {
+      const context = await app.get(ContextsService).ensureTenantContext(tenantId);
+      const roles = app.get(RolesService);
+      await roles.seedDefaults();
+      const manager = await roles.getRoleByShortname('manager');
+      if (!manager) throw new Error('Centre manager archetype missing');
+      await roles.assignRole(memberAId, manager.id, context.id);
+    });
     const centreLoginA = (await must(
       await helpers.http(app).post('/api/v1/auth/token').set('Host', HOST)
         .send({ username: memberA.username, password: helpers.STRONG_PASSWORD }),
@@ -364,35 +375,27 @@ describe('Socket realtime tại địa chỉ trung tâm ở kho riêng (đầu-c
       tid: tenantId,
     });
 
+    // A/B messages originate in the dedicated centre itself. No legacy message is
+    // created at the platform apex and copied into the space afterwards.
+    const apexLegacySend = await helpers.http(app).post('/api/v1/messages/conversations')
+      .set(auth(tokenWithoutClaim))
+      .send({ type: 2, memberIds: [memberAId, memberBId], name: 'Nhóm legacy không hợp lệ' });
+    expect(apexLegacySend.status).toBe(401);
     const conv = await helpers.http(app).post('/api/v1/messages/conversations')
-      .set(auth(adminToken))
+      .set('Host', HOST).set(auth(tokenWithClaim))
       .send({ type: 2, memberIds: [memberAId, memberBId], name: 'Nhóm kho riêng 587' });
-    expect(conv.status).toBe(201);
+    expect(conv.status, JSON.stringify(conv.body)).toBe(201);
     convId = (conv.body as { id: string }).id;
     const sent = await helpers.http(app).post(`/api/v1/messages/conversations/${convId}/messages`)
-      .set(auth(tokenWithoutClaim))
+      .set('Host', HOST).set(auth(tokenWithClaim))
       .send({ text: MESSAGE_TEXT });
-    expect(sent.status).toBe(201);
-    const convTenantId = await withClient(process.env.DATABASE_URL!, async (client) => {
-      await client.query("SELECT set_config('app.platform', 'on', false)");
-      const result = await client.query<{ tenant_id: string }>(
-        'SELECT tenant_id FROM message_conversations WHERE id = $1',
-        [convId],
-      );
-      return result.rows[0]!.tenant_id;
-    });
-    if (convTenantId !== tenantId) {
-      await copyRowById(process.env.DATABASE_URL!, centreUrl, 'tenants', convTenantId);
-    }
-    await copyRowById(process.env.DATABASE_URL!, centreUrl, 'message_conversations', convId);
-    await copyRows(process.env.DATABASE_URL!, centreUrl, 'message_conversation_members', 'conversation_id', convId);
-    await copyRows(process.env.DATABASE_URL!, centreUrl, 'message', 'conversation_id', convId);
-
+    expect(sent.status, JSON.stringify(sent.body)).toBe(201);
+    expect(await countRows(process.env.DATABASE_URL!, 'message_conversations', 'id', convId)).toBe(0);
+    expect(await countRows(centreUrl, 'message_conversations', 'id', convId)).toBe(1);
+    // Remove the temporary shared fixture so the cookie/socket tests exercise
+    // only the dedicated store; keep the intentionally shared-only negative user.
     await withClient(process.env.DATABASE_URL!, async (client) => {
       await client.query("SELECT set_config('app.platform', 'on', false)");
-      await client.query('DELETE FROM message WHERE conversation_id = $1', [convId]);
-      await client.query('DELETE FROM message_conversation_members WHERE conversation_id = $1', [convId]);
-      await client.query('DELETE FROM message_conversations WHERE id = $1', [convId]);
       await client.query('DELETE FROM tenant_memberships WHERE tenant_id = $1 AND user_id = ANY($2)', [
         tenantId,
         [memberAId, memberBId],
